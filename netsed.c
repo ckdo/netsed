@@ -199,7 +199,12 @@ struct tracker_s {
   int csock;
   /// Socket to forward to server
   int fsock;
-  /// Last event time, for udp timeout
+  /// Socket to forward to the second server
+  int fsock2;
+  // Real fsock
+  int* real_fsock;
+
+    /// Last event time, for udp timeout
   time_t time;
   /// Connection state
   enum state_e state;
@@ -232,6 +237,11 @@ char* rhost;
 /// Remote Port.
 char* rport;
 
+/// Remote Host2.
+char* rhost2;
+/// Remote Port.
+char* rport2;
+
 /// Number of rules.
 int rules;
 /// Array of all rules.
@@ -260,7 +270,7 @@ void short_usage_hints(const char* why) {
 /// @param why the error message.
 void usage_hints(const char* why) {
   if (why) ERR("Error: %s\n\n",why);
-  ERR("Usage: netsed [option] proto lport rhost rport rule1 [ rule2 ... ]\n\n");
+  ERR("Usage: netsed [option] proto lport rhost rport rhost2 rport2 rule1 [ rule2 ... ]\n\n");
 #ifdef PARSE_LONG_OPT
   ERR("  options - can be --ipv4 or -4 to force address resolution in IPv4,\n");
   ERR("            --ipv6 or -6 to force address resolution in IPv6,\n");
@@ -276,7 +286,8 @@ void usage_hints(const char* why) {
   ERR("            traffic intercepting on some systems)\n");
   ERR("  rhost   - where connection should be forwarded (0 = use destination\n");
   ERR("            address of incoming connection, see README)\n");
-  ERR("  rport   - destination port (0 = dst port of incoming connection)\n");
+  ERR("  rhost2   - where connection should be forwarded (0 = use destination\n");
+  ERR("            address of incoming connection, see README)\n");  ERR("  rport2   - destination port (0 = dst port of incoming connection)\n");
   ERR("  ruleN   - replacement rules (see below)\n\n");
   ERR("General syntax of replacement rules: s/pat1/pat2[/expire]\n\n");
   ERR("This will replace all occurrences of pat1 with pat2 in any matching packet.\n");
@@ -313,6 +324,8 @@ void freetracker (struct tracker_s * conn)
     close(conn->csock);
   }
   close(conn->fsock);
+  close(conn->fsock2);
+
   free(conn);
 }
 
@@ -518,7 +531,7 @@ void parse_params(int argc,char* argv[]) {
   }
 
   // parse remaining positional parameters
-  if (argc<optind+5) short_usage_hints("not enough parameters");
+  if (argc<optind+7) short_usage_hints("not enough parameters");
 
   // protocole
   if (strcasecmp(argv[optind],"tcp")*strcasecmp(argv[optind],"udp")) short_usage_hints("incorrect protocol");
@@ -530,6 +543,8 @@ void parse_params(int argc,char* argv[]) {
   // remote host & port
   rhost = argv[optind++];
   rport = argv[optind++];
+  rhost2 = argv[optind++];
+  rport2 = argv[optind++];
 
   // allocate rule arrays, rule number is number of params after 5
   rule=malloc((argc-optind)*sizeof(struct rule_s));
@@ -697,7 +712,9 @@ void b2server_sed(struct tracker_s * conn, ssize_t rd);
 /// @param conn connection giving the sockets to use.
 void server2client_sed(struct tracker_s * conn) {
     ssize_t rd;
-    rd=read(conn->fsock,buf,sizeof(buf));
+
+    rd=read(*conn->real_fsock,buf,sizeof(buf));
+
     if ((rd<0) && (errno!=EAGAIN))
     {
       DBG("[!] server disconnected. (rd err) %s\n",strerror(errno));
@@ -746,7 +763,15 @@ void b2server_sed(struct tracker_s * conn, ssize_t rd) {
       printf("[+] Caught client -> server packet.\n");
       rd=sed_the_buffer(rd, conn->live, OUT);
       conn->time = now;
-      if (write(conn->fsock,b2,rd)<=0) {
+
+      if (strstr(b2,"GET /info") != NULL) {
+          printf("[+] Using 2nd forwarding remote connection.\n");
+          conn->real_fsock = &conn->fsock2;
+      } else {
+        printf("[+] Using 1st forwarding remote connection.\n");
+        conn->real_fsock = &conn->fsock;
+      }
+      if (write(*conn->real_fsock,b2,rd)<=0) {
         DBG("[!] server disconnected. (wr)\n");
         conn->state = DISCONNECTED;
       }
@@ -764,11 +789,17 @@ void sig_int(int signo)
 int main(int argc,char* argv[]) {
   int ret;
   in_port_t fixedport = 0;
+  in_port_t fixedport2 = 0;
+
   struct sockaddr_storage fixedhost;
-  struct addrinfo hints, *res, *reslist;
+  struct sockaddr_storage fixedhost2;
+
+  struct addrinfo hints, *res, *reslist, *reslist2;
   struct tracker_s * conn;
 
   memset(&fixedhost, '\0', sizeof(fixedhost));
+  memset(&fixedhost2, '\0', sizeof(fixedhost2));
+
   printf("netsed " VERSION " by Julien VdG <julien@silicone.homelinux.org>\n"
          "      based on 0.01c from Michal Zalewski <lcamtuf@ids.pl>\n");
   setbuffer(stdout,NULL,0);
@@ -784,6 +815,10 @@ int main(int argc,char* argv[]) {
     ERR("getaddrinfo(): %s\n", gai_strerror(ret));
     error("Impossible to resolve remote address or port.");
   }
+    if ((ret = getaddrinfo(rhost2, rport2, &hints, &reslist2))) {
+        ERR("getaddrinfo(): %s\n", gai_strerror(ret));
+        error("Impossible to resolve remote address or port.");
+    }
   /* We have candidates for remote host. */
   for (res = reslist; res; res = res->ai_next) {
     int sd = -1;
@@ -798,7 +833,21 @@ int main(int argc,char* argv[]) {
     close(sd);
     break;
   }
+    for (res = reslist2; res; res = res->ai_next) {
+        int sd = -1;
+
+        if ( (sd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0)
+            continue;
+        /* Has successfully built a socket for this address family. */
+        /* Record the address structure and the port. */
+        fixedport2 = get_port(res->ai_addr);
+        if (!is_addr_any(res->ai_addr))
+            memcpy(&fixedhost2, res->ai_addr, res->ai_addrlen);
+        close(sd);
+        break;
+    }
   freeaddrinfo(reslist);
+  freeaddrinfo(reslist2);
   if (res == NULL)
     error("Failed in resolving remote host.");
 
@@ -810,6 +859,16 @@ int main(int argc,char* argv[]) {
     printf("[+] Using dynamic (transparent proxy) forwarding with fixed addr %s.\n",rhost);
   else
     printf("[+] Using dynamic (transparent proxy) forwarding.\n");
+
+  if (fixedhost2.ss_family && fixedport2)
+      printf("[+] Using fixed forwarding2 to %s,%s.\n",rhost2,rport2);
+  else if (fixedport2)
+      printf("[+] Using dynamic (transparent proxy) forwarding2 with fixed port %s.\n",rport);
+  else if (fixedhost2.ss_family)
+      printf("[+] Using dynamic (transparent proxy) forwarding2 with fixed addr %s.\n",rhost);
+  else
+      printf("[+] Using dynamic (transparent proxy) forwarding2.\n");
+
 
   bind_and_listen(fixedhost.ss_family, tcp, lport);
 
@@ -824,9 +883,15 @@ int main(int argc,char* argv[]) {
 
   while (!stop) {
     struct sockaddr_storage s;
+    struct sockaddr_storage s2;
+
     socklen_t l = sizeof(s);
     struct sockaddr_storage conho;
+    struct sockaddr_storage conho2;
+
     in_port_t conpo;
+    in_port_t conpo2;
+
     char ipstr[INET6_ADDRSTRLEN], portstr[12];
 
     int sel;
@@ -856,7 +921,11 @@ int main(int argc,char* argv[]) {
           }
         }
         FD_SET(conn->fsock, &rd_set);
+        FD_SET(conn->fsock2, &rd_set);
+
         if (nfds < conn->fsock) nfds = conn->fsock;
+        if (nfds < conn->fsock2) nfds = conn->fsock2;
+
         // point on next
         conn = conn->n;
       }
@@ -951,30 +1020,48 @@ int main(int argc,char* argv[]) {
         getnameinfo((struct sockaddr *) &s, l, ipstr, sizeof(ipstr),
                     portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
         printf(" to %s,%s\n", ipstr, portstr);
+
         conpo = get_port((struct sockaddr *) &s);
 
         memcpy(&conho, &s, sizeof(conho));
 
         if (fixedport) conpo=fixedport;
+        if (fixedport2) conpo2=fixedport2;
+
         if (fixedhost.ss_family)
           memcpy(&conho, &fixedhost, sizeof(conho));
+        if (fixedhost2.ss_family)
+          memcpy(&conho2, &fixedhost2, sizeof(conho2));
 
         // forward to addr
         memcpy(&s, &conho, sizeof(s));
+        memcpy(&s2, &conho2, sizeof(s2));
+
         set_port((struct sockaddr *) &s, conpo);
+        set_port((struct sockaddr *) &s2, conpo2);
+
         getnameinfo((struct sockaddr *) &s, l, ipstr, sizeof(ipstr),
                     portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
         printf("[*] Forwarding connection to %s,%s\n", ipstr, portstr);
+        getnameinfo((struct sockaddr *) &s2, l, ipstr, sizeof(ipstr),
+                  portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
+
+        printf("[*] and to %s,%s\n", ipstr, portstr);
 
         // connect will bind with some dynamic addr/port
         conn->fsock = socket(s.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+        conn->fsock2 = socket(s.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
 
-        if (connect(conn->fsock,(struct sockaddr*)&s,l)) {
-           printf("[!] Cannot connect to remote server, dropping connection.\n");
+// int test1 = connect(conn->fsock,(struct sockaddr*)&s,l);
+// int test2 = connect(conn->fsock2,(struct sockaddr*)&s2,l);
+        if (connect(conn->fsock,(struct sockaddr*)&s,l) || connect(conn->fsock2,(struct sockaddr*)&s2,l)) {
+           printf("[!] Cannot connect to one of the remote servers, dropping connection.\n");
            freetracker(conn);
            conn = NULL;
         } else {
           setsockopt(conn->fsock,SOL_SOCKET,SO_OOBINLINE,&one,sizeof(int));
+          setsockopt(conn->fsock2,SOL_SOCKET,SO_OOBINLINE,&one,sizeof(int));
+
           conn->n = connections;
           connections = conn;
         }
@@ -992,7 +1079,7 @@ int main(int argc,char* argv[]) {
       if(tcp && FD_ISSET(conn->csock, &rd_set)) {
         client2server_sed(conn);
       }
-      if(FD_ISSET(conn->fsock, &rd_set)) {
+      if(FD_ISSET(conn->fsock, &rd_set) || FD_ISSET(conn->fsock2, &rd_set)) {
         server2client_sed(conn);
       }
       // timeout ? udp only
